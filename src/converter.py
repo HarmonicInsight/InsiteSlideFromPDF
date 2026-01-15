@@ -344,7 +344,7 @@ class Converter:
                 shape_type=shape_type,
                 fill_color=fill_color,
                 line_color=line_color,
-                line_width=max(drawing.get('width', 1), 0.5)
+                line_width=max(drawing.get('width') or 1, 0.5)
             ))
 
         # 4. Add colored objects detected from rendered image
