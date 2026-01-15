@@ -11,7 +11,7 @@ from PIL import Image
 import cv2
 import numpy as np
 
-from .pdf_processor import PDFProcessor, PageContent, ExtractedText, ExtractedImage
+from .pdf_processor import PDFProcessor, PageContent, ExtractedText, ExtractedImage, TextBlock
 from .image_processor import ImageProcessor, OCRResult, DetectedShape
 from .color_detector import ColorDetector, ColoredObject, ColorType
 from .pptx_generator import (
@@ -116,7 +116,7 @@ class Converter:
         output_path: str,
         progress_callback: Optional[ProgressCallback]
     ) -> bool:
-        """Convert PDF to PowerPoint."""
+        """Convert PDF to PowerPoint with proper objects (no background image)."""
         processor = PDFProcessor(input_path)
 
         if not processor.open():
@@ -141,15 +141,14 @@ class Converter:
                 if not page_content:
                     continue
 
-                # Render page as high-quality image
-                page_image = processor.render_page_as_image(page_num, self.settings.processing.dpi)
-
-                # Step 2: Detect colored objects
+                # Step 2: Process - render page image for color detection, extract drawings
                 self._report_progress(
                     progress_callback,
                     step_base + 2, total_steps,
                     f"Processing page {page_num + 1}/{page_count}"
                 )
+
+                page_image = processor.render_page_as_image(page_num, self.settings.processing.dpi)
 
                 colored_objects = []
                 if self.settings.processing.detect_colors and page_image:
@@ -158,6 +157,9 @@ class Converter:
                         cv_image,
                         min_area=self.settings.processing.min_color_area
                     )
+
+                # Extract vector drawings from PDF
+                drawings = processor.extract_drawings(page_num)
 
                 # Step 3: Generate slide
                 self._report_progress(
@@ -170,7 +172,8 @@ class Converter:
                     generator,
                     page_content,
                     page_image,
-                    colored_objects
+                    colored_objects,
+                    drawings
                 )
 
             generator.save(output_path)
@@ -243,72 +246,119 @@ class Converter:
         generator: PPTXGenerator,
         page_content: PageContent,
         page_image: Optional[Image.Image],
-        colored_objects: List[ColoredObject]
+        colored_objects: List[ColoredObject],
+        drawings: List[dict]
     ):
-        """Create a slide from PDF page content."""
+        """Create a slide from PDF page content using actual PowerPoint objects (no background)."""
         elements = []
         source_width = page_content.width
         source_height = page_content.height
 
-        # 1. Add background image first (maintains original layout)
+        # Image dimensions for color object coordinate conversion
+        img_width = img_height = 1
         if page_image:
             img_width, img_height = page_image.size
-            elements.append(ImageElement(
-                x=0, y=0,
-                width=generator.SLIDE_WIDTH_INCHES,
-                height=generator.SLIDE_HEIGHT_INCHES,
-                image=page_image
-            ))
 
-            # Calculate scale for coordinate conversion
-            img_scale_x = img_width / source_width
-            img_scale_y = img_height / source_height
-        else:
-            img_scale_x = 1.0
-            img_scale_y = 1.0
+        # 1. Add text blocks as text boxes (using block-level extraction)
+        for block in page_content.text_blocks:
+            x0, y0, x1, y1 = block.bbox
 
-        # 2. Group texts into larger paragraph blocks
-        text_paragraphs = self._group_texts_into_paragraphs(page_content.texts, source_height)
-
-        # 3. Add text blocks as editable text boxes
-        for paragraph in text_paragraphs:
-            text_content = paragraph['text']
-            bbox = paragraph['bbox']
-            font_size = paragraph['font_size']
-
-            x_in, y_in = generator.convert_position_to_inches(
-                bbox[0], bbox[1], source_width, source_height
-            )
-            w_in, h_in = generator.convert_size_to_inches(
-                bbox[2] - bbox[0], bbox[3] - bbox[1], source_width, source_height
-            )
+            # Convert PDF coordinates to PowerPoint inches
+            x_in = (x0 / source_width) * generator.SLIDE_WIDTH_INCHES
+            y_in = (y0 / source_height) * generator.SLIDE_HEIGHT_INCHES
+            w_in = ((x1 - x0) / source_width) * generator.SLIDE_WIDTH_INCHES
+            h_in = ((y1 - y0) / source_height) * generator.SLIDE_HEIGHT_INCHES
 
             # Ensure minimum size
-            w_in = max(w_in, 1.0)
-            h_in = max(h_in, 0.4)
+            w_in = max(w_in, 0.5)
+            h_in = max(h_in, 0.3)
+
+            # Clean up text
+            text = block.text.replace('\n\n', '\n').strip()
+            if not text:
+                continue
 
             elements.append(TextElement(
                 x=x_in, y=y_in,
                 width=w_in, height=h_in,
-                text=text_content,
-                font_size=min(max(font_size, 8), 36),
+                text=text,
+                font_size=min(max(block.font_size, 8), 36),
                 font_name=self.settings.font.default_font,
                 font_color=(0, 0, 0)
             ))
 
-        # 4. Add colored objects as shapes (on top of background)
-        if page_image:
-            img_width, img_height = page_image.size
+        # 2. Add images from PDF
+        for img in page_content.images:
+            x0, y0, x1, y1 = img.bbox
+
+            x_in = (x0 / source_width) * generator.SLIDE_WIDTH_INCHES
+            y_in = (y0 / source_height) * generator.SLIDE_HEIGHT_INCHES
+            w_in = ((x1 - x0) / source_width) * generator.SLIDE_WIDTH_INCHES
+            h_in = ((y1 - y0) / source_height) * generator.SLIDE_HEIGHT_INCHES
+
+            # Skip very small images
+            if w_in < 0.3 or h_in < 0.3:
+                continue
+
+            elements.append(ImageElement(
+                x=x_in, y=y_in,
+                width=w_in, height=h_in,
+                image=img.image
+            ))
+
+        # 3. Add vector drawings as shapes
+        for drawing in drawings:
+            rect = drawing.get('rect')
+            if not rect:
+                continue
+
+            x0, y0, x1, y1 = rect
+            x_in = (x0 / source_width) * generator.SLIDE_WIDTH_INCHES
+            y_in = (y0 / source_height) * generator.SLIDE_HEIGHT_INCHES
+            w_in = ((x1 - x0) / source_width) * generator.SLIDE_WIDTH_INCHES
+            h_in = ((y1 - y0) / source_height) * generator.SLIDE_HEIGHT_INCHES
+
+            # Skip very small drawings
+            if w_in < 0.2 or h_in < 0.2:
+                continue
+
+            # Get colors
+            fill_color = None
+            line_color = (0, 0, 0)
+
+            fill = drawing.get('fill')
+            if fill and len(fill) >= 3:
+                fill_color = (int(fill[0] * 255), int(fill[1] * 255), int(fill[2] * 255))
+
+            color = drawing.get('color')
+            if color and len(color) >= 3:
+                line_color = (int(color[0] * 255), int(color[1] * 255), int(color[2] * 255))
+
+            shape_type = ShapeType.RECTANGLE
+            if drawing.get('type') == 'curve':
+                shape_type = ShapeType.OVAL
+
+            elements.append(ShapeElement(
+                x=x_in, y=y_in,
+                width=w_in, height=h_in,
+                shape_type=shape_type,
+                fill_color=fill_color,
+                line_color=line_color,
+                line_width=max(drawing.get('width', 1), 0.5)
+            ))
+
+        # 4. Add colored objects detected from rendered image
+        if page_image and colored_objects:
             for obj in colored_objects:
                 x, y, w, h = obj.bbox
 
-                # Convert from image coordinates to slide coordinates
+                # Convert from image coordinates to slide inches
                 x_in = (x / img_width) * generator.SLIDE_WIDTH_INCHES
                 y_in = (y / img_height) * generator.SLIDE_HEIGHT_INCHES
                 w_in = (w / img_width) * generator.SLIDE_WIDTH_INCHES
                 h_in = (h / img_height) * generator.SLIDE_HEIGHT_INCHES
 
-                # Skip very small objects
+                # Skip small objects
                 if w_in < 0.3 or h_in < 0.3:
                     continue
 
@@ -316,8 +366,7 @@ class Converter:
 
                 elements.append(ShapeElement(
                     x=x_in, y=y_in,
-                    width=w_in,
-                    height=h_in,
+                    width=w_in, height=h_in,
                     shape_type=shape_type,
                     fill_color=obj.rgb_color,
                     line_color=self._darken_color(obj.rgb_color),
@@ -337,21 +386,12 @@ class Converter:
         colored_objects: List[ColoredObject],
         shapes: List[DetectedShape]
     ):
-        """Create a slide from image content."""
+        """Create a slide from image content (no background)."""
         elements = []
 
-        # 1. Add image as background
-        elements.append(ImageElement(
-            x=0, y=0,
-            width=generator.SLIDE_WIDTH_INCHES,
-            height=generator.SLIDE_HEIGHT_INCHES,
-            image=image
-        ))
-
-        # 2. Group OCR results into paragraph blocks
+        # 1. Group OCR results into text blocks and add
         text_paragraphs = self._group_ocr_into_paragraphs(ocr_results, height)
 
-        # 3. Add text blocks
         for paragraph in text_paragraphs:
             text_content = paragraph['text']
             bbox = paragraph['bbox']
@@ -361,9 +401,8 @@ class Converter:
             w_in = ((bbox[2] - bbox[0]) / width) * generator.SLIDE_WIDTH_INCHES
             h_in = ((bbox[3] - bbox[1]) / height) * generator.SLIDE_HEIGHT_INCHES
 
-            # Ensure minimum size
-            w_in = max(w_in, 1.0)
-            h_in = max(h_in, 0.4)
+            w_in = max(w_in, 0.5)
+            h_in = max(h_in, 0.3)
 
             elements.append(TextElement(
                 x=x_in, y=y_in,
@@ -374,7 +413,7 @@ class Converter:
                 font_color=(0, 0, 0)
             ))
 
-        # 4. Add colored objects as shapes
+        # 2. Add colored objects as shapes
         for obj in colored_objects:
             x, y, w, h = obj.bbox
             x_in = (x / width) * generator.SLIDE_WIDTH_INCHES
@@ -382,7 +421,6 @@ class Converter:
             w_in = (w / width) * generator.SLIDE_WIDTH_INCHES
             h_in = (h / height) * generator.SLIDE_HEIGHT_INCHES
 
-            # Skip very small objects
             if w_in < 0.3 or h_in < 0.3:
                 continue
 
@@ -390,15 +428,14 @@ class Converter:
 
             elements.append(ShapeElement(
                 x=x_in, y=y_in,
-                width=w_in,
-                height=h_in,
+                width=w_in, height=h_in,
                 shape_type=shape_type,
                 fill_color=obj.rgb_color,
                 line_color=self._darken_color(obj.rgb_color),
                 line_width=1.5
             ))
 
-        # 5. Add detected shapes
+        # 3. Add detected shapes
         for shape in shapes:
             x, y, w, h = shape.bbox
             x_in = (x / width) * generator.SLIDE_WIDTH_INCHES
@@ -406,7 +443,6 @@ class Converter:
             w_in = (w / width) * generator.SLIDE_WIDTH_INCHES
             h_in = (h / height) * generator.SLIDE_HEIGHT_INCHES
 
-            # Skip very small shapes
             if w_in < 0.3 or h_in < 0.3:
                 continue
 
@@ -414,113 +450,24 @@ class Converter:
 
             elements.append(ShapeElement(
                 x=x_in, y=y_in,
-                width=w_in,
-                height=h_in,
+                width=w_in, height=h_in,
                 shape_type=shape_type,
                 fill_color=None,
                 line_color=(0, 0, 0),
                 line_width=1
             ))
 
+        # 4. If no elements were created, add the original image as fallback
+        if not elements:
+            elements.append(ImageElement(
+                x=0, y=0,
+                width=generator.SLIDE_WIDTH_INCHES,
+                height=generator.SLIDE_HEIGHT_INCHES,
+                image=image
+            ))
+
         content = SlideContent(elements=elements)
         generator.add_slide_with_content(content)
-
-    def _group_texts_into_paragraphs(
-        self,
-        texts: List[ExtractedText],
-        page_height: float,
-        line_spacing_threshold: float = 3.0,
-        paragraph_gap_threshold: float = 15.0
-    ) -> List[dict]:
-        """
-        Group text elements into paragraph blocks.
-
-        Returns list of dicts with 'text', 'bbox', 'font_size'.
-        """
-        if not texts:
-            return []
-
-        # Sort by y position (top to bottom), then x position (left to right)
-        sorted_texts = sorted(texts, key=lambda t: (round(t.bbox[1] / 5) * 5, t.bbox[0]))
-
-        paragraphs = []
-        current_paragraph_texts = []
-        current_line_texts = []
-        current_line_y = None
-
-        for text in sorted_texts:
-            text_y = text.bbox[1]
-
-            if current_line_y is None:
-                # First text
-                current_line_y = text_y
-                current_line_texts = [text]
-            elif abs(text_y - current_line_y) <= line_spacing_threshold:
-                # Same line
-                current_line_texts.append(text)
-            else:
-                # New line - check if it's a new paragraph
-                if current_line_texts:
-                    # Add current line to paragraph
-                    current_paragraph_texts.extend(current_line_texts)
-
-                if text_y - current_line_y > paragraph_gap_threshold:
-                    # New paragraph - save current and start new
-                    if current_paragraph_texts:
-                        paragraphs.append(self._create_paragraph_block(current_paragraph_texts))
-                    current_paragraph_texts = []
-
-                current_line_y = text_y
-                current_line_texts = [text]
-
-        # Don't forget the last line and paragraph
-        if current_line_texts:
-            current_paragraph_texts.extend(current_line_texts)
-        if current_paragraph_texts:
-            paragraphs.append(self._create_paragraph_block(current_paragraph_texts))
-
-        return paragraphs
-
-    def _create_paragraph_block(self, texts: List[ExtractedText]) -> dict:
-        """Create a paragraph block from a list of texts."""
-        # Sort texts left to right for proper reading order
-        sorted_texts = sorted(texts, key=lambda t: (round(t.bbox[1] / 5) * 5, t.bbox[0]))
-
-        # Build text content
-        lines = []
-        current_line = []
-        current_y = None
-
-        for text in sorted_texts:
-            if current_y is None or abs(text.bbox[1] - current_y) <= 5:
-                current_line.append(text.text)
-                if current_y is None:
-                    current_y = text.bbox[1]
-            else:
-                if current_line:
-                    lines.append(" ".join(current_line))
-                current_line = [text.text]
-                current_y = text.bbox[1]
-
-        if current_line:
-            lines.append(" ".join(current_line))
-
-        text_content = "\n".join(lines)
-
-        # Calculate bounding box
-        min_x = min(t.bbox[0] for t in texts)
-        min_y = min(t.bbox[1] for t in texts)
-        max_x = max(t.bbox[2] for t in texts)
-        max_y = max(t.bbox[3] for t in texts)
-
-        # Average font size
-        avg_font_size = sum(t.font_size for t in texts) / len(texts)
-
-        return {
-            'text': text_content,
-            'bbox': (min_x, min_y, max_x, max_y),
-            'font_size': avg_font_size
-        }
 
     def _group_ocr_into_paragraphs(
         self,
@@ -533,12 +480,10 @@ class Converter:
         if not ocr_results:
             return []
 
-        # Filter low confidence results
         filtered = [r for r in ocr_results if r.confidence > 0.5 and r.text.strip()]
         if not filtered:
             return []
 
-        # Sort by y then x
         sorted_results = sorted(filtered, key=lambda r: (r.bbox[1] // 10 * 10, r.bbox[0]))
 
         paragraphs = []
@@ -554,13 +499,11 @@ class Converter:
             elif abs(y - current_line_y) <= line_threshold:
                 current_paragraph.append(result)
             elif y - current_line_y > paragraph_gap:
-                # New paragraph
                 if current_paragraph:
                     paragraphs.append(self._create_ocr_paragraph(current_paragraph))
                 current_paragraph = [result]
                 current_line_y = y
             else:
-                # Same paragraph, new line
                 current_paragraph.append(result)
                 current_line_y = y
 
@@ -571,10 +514,8 @@ class Converter:
 
     def _create_ocr_paragraph(self, results: List[OCRResult]) -> dict:
         """Create paragraph from OCR results."""
-        # Sort by y then x
         sorted_results = sorted(results, key=lambda r: (r.bbox[1] // 10 * 10, r.bbox[0]))
 
-        # Build text
         lines = []
         current_line = []
         current_y = None
@@ -596,7 +537,6 @@ class Converter:
 
         text_content = "\n".join(lines)
 
-        # Bounding box
         min_x = min(r.bbox[0] for r in results)
         min_y = min(r.bbox[1] for r in results)
         max_x = max(r.bbox[0] + r.bbox[2] for r in results)

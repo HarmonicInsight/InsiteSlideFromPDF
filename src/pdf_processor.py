@@ -30,12 +30,22 @@ class ExtractedText:
 
 
 @dataclass
+class TextBlock:
+    """Represents a text block (paragraph-level) from PDF."""
+    text: str
+    page_num: int
+    bbox: Tuple[float, float, float, float]  # x0, y0, x1, y1
+    font_size: float  # Average font size in block
+
+
+@dataclass
 class PageContent:
     """Represents all content from a single PDF page."""
     page_num: int
     width: float
     height: float
     texts: List[ExtractedText]
+    text_blocks: List[TextBlock]  # Block-level text
     images: List[ExtractedImage]
 
 
@@ -96,6 +106,7 @@ class PDFProcessor:
         height = page.rect.height
 
         texts = self._extract_texts(page, page_num)
+        text_blocks = self._extract_text_blocks(page, page_num)
         images = self._extract_images(page, page_num)
 
         return PageContent(
@@ -103,12 +114,48 @@ class PDFProcessor:
             width=width,
             height=height,
             texts=texts,
+            text_blocks=text_blocks,
             images=images
         )
 
+    def _extract_text_blocks(self, page: fitz.Page, page_num: int) -> List[TextBlock]:
+        """
+        Extract text at block level (paragraph-like grouping).
+
+        Args:
+            page: PyMuPDF page object.
+            page_num: Page number.
+
+        Returns:
+            List of TextBlock objects.
+        """
+        blocks = []
+
+        # Get text blocks - returns (x0, y0, x1, y1, "text", block_no, block_type)
+        raw_blocks = page.get_text("blocks")
+
+        for block in raw_blocks:
+            if len(block) >= 7 and block[6] == 0:  # Text block (type 0)
+                x0, y0, x1, y1, text, block_no, block_type = block[:7]
+                text = text.strip()
+                if text:
+                    # Estimate font size from block height and line count
+                    line_count = text.count('\n') + 1
+                    avg_line_height = (y1 - y0) / line_count
+                    estimated_font_size = avg_line_height * 0.7  # Approximate
+
+                    blocks.append(TextBlock(
+                        text=text,
+                        page_num=page_num,
+                        bbox=(x0, y0, x1, y1),
+                        font_size=max(8, min(estimated_font_size, 48))
+                    ))
+
+        return blocks
+
     def _extract_texts(self, page: fitz.Page, page_num: int) -> List[ExtractedText]:
         """
-        Extract text blocks from a page.
+        Extract text spans from a page (fine-grained).
 
         Args:
             page: PyMuPDF page object.
@@ -176,6 +223,52 @@ class PDFProcessor:
                 print(f"Error extracting image (xref={xref}): {e}")
 
         return images
+
+    def extract_drawings(self, page_num: int) -> List[Dict]:
+        """
+        Extract vector drawings/shapes from a page.
+
+        Args:
+            page_num: Page number (0-indexed).
+
+        Returns:
+            List of drawing dictionaries with type and coordinates.
+        """
+        if not self.doc or page_num >= len(self.doc):
+            return []
+
+        page = self.doc[page_num]
+        drawings = []
+
+        try:
+            paths = page.get_drawings()
+            for path in paths:
+                drawing = {
+                    'rect': path.get('rect'),
+                    'fill': path.get('fill'),
+                    'color': path.get('color'),
+                    'width': path.get('width', 1),
+                    'items': path.get('items', [])
+                }
+
+                # Determine shape type from items
+                items = path.get('items', [])
+                if items:
+                    first_item = items[0]
+                    if first_item[0] == 're':  # Rectangle
+                        drawing['type'] = 'rectangle'
+                    elif first_item[0] == 'c':  # Curve
+                        drawing['type'] = 'curve'
+                    elif first_item[0] == 'l':  # Line
+                        drawing['type'] = 'line'
+                    else:
+                        drawing['type'] = 'path'
+
+                drawings.append(drawing)
+        except Exception as e:
+            print(f"Error extracting drawings: {e}")
+
+        return drawings
 
     def extract_all_pages(self, progress_callback=None) -> List[PageContent]:
         """
